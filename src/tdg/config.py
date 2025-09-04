@@ -1,0 +1,10 @@
+from dotenv import load_dotenv; load_dotenv()
+import os
+DB_URL = os.getenv("DB_URL", "postgresql+psycopg2://tdg:tdg@localhost:5432/tdg")
+API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+DEFAULT_USERS=int(os.getenv("DEFAULT_USERS","200"))
+DEFAULT_PRODUCTS=int(os.getenv("DEFAULT_PRODUCTS","80"))
+DEFAULT_ORDERS=int(os.getenv("DEFAULT_ORDERS","800"))
+DEFAULT_REVIEWS=int(os.getenv("DEFAULT_REVIEWS","600"))
+SEED=int(os.getenv("SEED","42"))
+OUT_DIR=os.getenv("OUT_DIR","./out")

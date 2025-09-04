@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: tdg
+Version: 0.1.0
+Summary: Test Data Generator Kit
+Requires-Python: >=3.10

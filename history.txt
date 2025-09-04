@@ -1,0 +1,16 @@
+ 1121  docker compose logs -f postgres
+ 1122  PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -d tdg -c "select 1;"
+ 1123  cat  docker-compose.yml
+ 1124  docker compose down -v
+ 1125  docker rm -f tdgpg 2>/dev/null || true
+ 1126  docker volume rm tdgpgdata 2>/dev/null || true
+ 1127  docker run -d --name tdgpg \\n  -e POSTGRES_USER=postgres \\n  -e POSTGRES_PASSWORD=postgres \\n  -e POSTGRES_DB=tdg \\n  -e PGDATA=/var/lib/postgresql/data/pgdata \\n  -v tdgpgdata:/var/lib/postgresql/data/pgdata \\n  -p 55432:5432 \\n  postgres:16
+ 1128  PGPASSWORD=postgres psql -h 127.0.0.1 -p 55432 -U postgres -d tdg -c "select 1;"
+ 1129  PGPASSWORD=postgres psql -h 127.0.0.1 -p 55432 -U postgres -d tdg \\n  -c "CREATE USER tdg WITH PASSWORD 'tdg' SUPERUSER;"
+ 1130  export DB_URL="postgresql+psycopg2://tdg:tdg@127.0.0.1:55432/tdg"
+ 1131  python -m tdg.cli seed-postgres --create --truncate
+ 1132  # create tables\nPGPASSWORD=tdg psql -h 127.0.0.1 -p 55432 -U tdg -d tdg <<'SQL'\nCREATE TABLE IF NOT EXISTS users (\n  id INT PRIMARY KEY,\n  name TEXT,\n  email TEXT UNIQUE,\n  phone TEXT,\n  country TEXT,\n  created_at TIMESTAMPTZ,\n  is_active BOOLEAN\n);\nCREATE TABLE IF NOT EXISTS products (\n  id INT PRIMARY KEY,\n  sku TEXT UNIQUE,\n  name TEXT,\n  category TEXT,\n  price NUMERIC,\n  stock INT,\n  popularity DOUBLE PRECISION,\n  created_at TIMESTAMPTZ\n);\nCREATE TABLE IF NOT EXISTS orders (\n  id INT PRIMARY KEY,\n  user_id INT REFERENCES users(id) ON DELETE CASCADE,\n  product_id INT REFERENCES products(id) ON DELETE CASCADE,\n  quantity INT,\n  total NUMERIC,\n  status TEXT,\n  created_at TIMESTAMPTZ\n);\nCREATE TABLE IF NOT EXISTS reviews (\n  id INT PRIMARY KEY,\n  user_id INT REFERENCES users(id) ON DELETE CASCADE,\n  product_id INT REFERENCES products(id) ON DELETE CASCADE,\n  rating INT,\n  title TEXT,\n  body TEXT,\n  created_at TIMESTAMPTZ\n);\nSQL\n\n# now seed (you can include --truncate from now on)\nexport DB_URL="postgresql+psycopg2://tdg:tdg@127.0.0.1:55432/tdg"\npython -m tdg.cli seed-postgres --truncate
+ 1133  PGPASSWORD=tdg psql -h 127.0.0.1 -p 55432 -U tdg -d tdg -c \\n"SELECT 'users' tbl, COUNT(*) FROM users UNION ALL\n SELECT 'products', COUNT(*) FROM products UNION ALL\n SELECT 'orders', COUNT(*) FROM orders UNION ALL\n SELECT 'reviews', COUNT(*) FROM reviews;"
+ 1134  SELECT p.id, p.name, SUM(o.total) AS revenue\nFROM orders o\nJOIN products p ON p.id = o.product_id\nGROUP BY p.id, p.name\nORDER BY revenue DESC\nLIMIT 5;
+ 1135  PGPASSWORD=tdg psql -h 127.0.0.1 -p 55432 -U tdg -d tdg -c "\nSELECT p.id, p.name, SUM(o.total) AS revenue\nFROM orders o\nJOIN products p ON p.id = o.product_id\nGROUP BY p.id, p.name\nORDER BY revenue DESC\nLIMIT 5;"
+ 1136  PGPASSWORD=tdg psql -h 127.0.0.1 -p 55432 -U tdg -d tdg
