@@ -2,8 +2,26 @@
 
 Synthetic test data generator built with **Python + Faker**.  
 Designed to create realistic, consistent, and scalable datasets for development and testing.
-
 ---
+---
+
+## 🔐 Test Data Anonymization Toolkit
+
+This repo now includes a **data masking & anonymization toolkit** under  
+[`tools/anonymizer`](tools/anonymizer).
+
+- **`mask_db.py`** → anonymizes sensitive fields (`users.email`, `users.full_name`, `users.password`, `reviews.comment`)  
+- **`reproducible_run.sh`** → sets up venv, installs deps, prepares DBs, runs masking, runs comparison  
+- **`demo_compare.sh`** → shows before/after row counts, samples, email validity, and FK checks  
+- **`.env.example`** → connection settings template  
+- **`requirements.txt`** → pinned Python dependencies  
+
+👉 To try it out:
+
+```bash
+cd tools/anonymizer
+cp .env.example .env   # adjust DB connection
+./reproducible_run.sh
 
 ## ✨ Features
 
@@ -112,3 +130,22 @@ This project extends Faker into a **full test data system**:
 - Automated workflows ✔  
 - Supports files, databases, and APIs ✔  
 - Optional anonymization for compliance ✔
+---
+
+## 🔐 Test Data Anonymization Toolkit
+
+This repo now includes a **data masking & anonymization toolkit** under  
+[`tools/anonymizer`](tools/anonymizer).
+
+- **`mask_db.py`** → anonymizes sensitive fields (`users.email`, `users.full_name`, `users.password`, `reviews.comment`)  
+- **`reproducible_run.sh`** → sets up venv, installs deps, prepares DBs, runs masking, runs comparison  
+- **`demo_compare.sh`** → shows before/after row counts, samples, email validity, and FK checks  
+- **`.env.example`** → connection settings template  
+- **`requirements.txt`** → pinned Python dependencies  
+
+👉 To try it out:
+
+```bash
+cd tools/anonymizer
+cp .env.example .env   # adjust DB connection
+./reproducible_run.sh
