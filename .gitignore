@@ -1,9 +1,46 @@
+# -------------------------
+# Python
+# -------------------------
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+*.egg
+*.log
+
+# Byte-compiled / optimized / DLL files
+*.so
+*.dll
+*.dylib
+
+# Virtual environments
 .venv/
-.env
+venv/
+ENV/
+env/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# -------------------------
+# OS / Editor files
+# -------------------------
 .DS_Store
-out/
-pgdata/
-.vscode/
-.idea/
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+
+# -------------------------
+# Project-specific
+# -------------------------
+# API keys / secrets
+.env
+key
+dotenv
+
+# Local test data backups
+*.bak
+*.old

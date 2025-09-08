@@ -1,0 +1,13 @@
+users:
+  columns:
+    email:
+      provider: internet.email
+    full_name:
+      provider: person.name
+    password:
+      provider: password.hash
+
+reviews:
+  columns:
+    comment:
+      provider: text.sentence

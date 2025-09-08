@@ -1,15 +1,15 @@
-# Python dependencies for Test Data Hackathon solution
-
-# Database drivers
+# Core database + masking
 psycopg2-binary==2.9.10
-
-# Data generation / anonymization
 Faker==37.6.0
+bcrypt==4.2.1
+pyyaml==6.0.2
 
-# Web framework (if running FastAPI app)
+# API + web
 fastapi==0.116.1
 uvicorn==0.35.0
 
 # Testing
 pytest==8.3.3
-bcrypt==4.2.1
+
+# AI assistant
+openai>=1.106,<2

@@ -1,210 +1,271 @@
-import os, hashlib, json
+#!/usr/bin/env python3
+"""
+Fast anonymizer for the Hackathon DB.
+
+- Reads optional faker_mapping.yaml to decide which columns to mask.
+- Deterministic, unique emails using id + md5 -> example.test
+- Bcrypt cost adjustable via env BCRYPT_ROUNDS (default 4 for speed)
+- DRY_LIMIT (env) copies a filtered, referentially consistent slice.
+- Truncates destination tables before writing to avoid PK collisions.
+- Writes a masking_audit record.
+
+Env vars used:
+  PGHOST, PGPORT, PGUSER, PGPASSWORD
+  SRC_DB, DST_DB
+  DRY_LIMIT (optional int)
+  BCRYPT_ROUNDS (optional int, default 4)
+"""
+
+import os
+import random
+import hashlib
+from datetime import datetime, timezone
+
+import bcrypt
 import psycopg2
 import psycopg2.extras as ex
 from faker import Faker
+import yaml
 
-# --- Config ---
-SEED = 123
-SALT = "TDG_SALT_2025"
-BATCH = 5000
-DRY_LIMIT = int(os.getenv("DRY_LIMIT", "0"))  # 0 = full data
+# ------------------------------
+# Config & PRNG/Faker seeding
+# ------------------------------
+faker = Faker()
+Faker.seed(1234)
+random.seed(1234)
 
-PGHOST = os.getenv("PGHOST", "127.0.0.1")
-PGPORT = int(os.getenv("PGPORT", "55433"))
-PGUSER = os.getenv("PGUSER", "hackathon_user")
-PGPASSWORD = os.getenv("PGPASSWORD", "hackathon_pass")
-SRC_DB = os.getenv("SRC_DB", "hackathon_db")
-DST_DB = os.getenv("DST_DB", "hackathon_db_masked")
+BATCH = 1000
+BCRYPT_ROUNDS = int(os.environ.get("BCRYPT_ROUNDS", "4"))  # lower = faster; 10-12 is prod-like
 
-fk = Faker(); fk.seed_instance(SEED)
+# Load mapping file if present; otherwise default mapping.
+DEFAULT_MAPPING = {
+    "users": {
+        "columns": {
+            "email": {"provider": "internet.email"},
+            "full_name": {"provider": "person.name"},
+            "password": {"provider": "password.hash"},
+        }
+    },
+    "reviews": {
+        "columns": {
+            "comment": {"provider": "text.sentence"},
+        }
+    },
+}
 
-# --- Helpers ---
-def connect(db: str):
-    return psycopg2.connect(host=PGHOST, port=PGPORT, user=PGUSER, password=PGPASSWORD, dbname=db)
+def load_mapping(path="faker_mapping.yaml"):
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            data = yaml.safe_load(f)
+            return data or DEFAULT_MAPPING
+    return DEFAULT_MAPPING
 
-def get_columns(conn, table: str, schema: str = "public"):
-    """Fetch stable column order from information_schema."""
-    with conn.cursor() as c:
-        c.execute("""
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = %s AND table_name = %s
-            ORDER BY ordinal_position
-        """, (schema, table))
-        return [r[0] for r in c.fetchall()]
+MAPPING = load_mapping()
 
-def mask_email(email: str, user_id: int) -> str:
-    if not email:
-        return f"{hashlib.md5((SALT+str(user_id)).encode()).hexdigest()[:10]}@example.test"
-    if "@" in email:
-        local, domain = email.split("@", 1)
+
+# ------------------------------
+# DB helpers
+# ------------------------------
+def connect(dbname: str):
+    return psycopg2.connect(
+        host=os.environ.get("PGHOST", "127.0.0.1"),
+        port=os.environ.get("PGPORT", "5432"),
+        user=os.environ.get("PGUSER", "postgres"),
+        password=os.environ.get("PGPASSWORD", ""),
+        dbname=dbname,
+    )
+
+
+def truncate_all(dst):
+    """Start clean to avoid duplicate PK issues on reruns."""
+    with dst.cursor() as cur:
+        cur.execute("TRUNCATE TABLE reviews, orders, users, products RESTART IDENTITY CASCADE;")
+    dst.commit()
+
+
+def colnames(cur, table: str):
+    cur.execute(f'SELECT * FROM "{table}" LIMIT 0;')
+    return [d.name for d in cur.description]
+
+
+def select_ids(conn, table: str, limit: int):
+    with conn.cursor() as cur:
+        cur.execute(f'SELECT id FROM "{table}" ORDER BY id LIMIT %s;', (limit,))
+        return [r[0] for r in cur.fetchall()]
+
+
+# ------------------------------
+# Masking primitives
+# ------------------------------
+def mask_value(table: str, col: str, value, *, row_ctx=None):
+    """Return masked value based on faker_mapping; deterministic where needed."""
+    cfg = (MAPPING.get(table, {}) or {}).get("columns", {}).get(col, {})
+    provider = cfg.get("provider")
+    if not provider:
+        return value
+
+    # Row context is used for deterministic unique emails based on id.
+    row_ctx = row_ctx or {}
+
+    if provider == "internet.email":
+        # Deterministic, unique, and fast (no faker.unique) — prefer id if available
+        uid = row_ctx.get("id")
+        base = str(value) if value is not None else ""
+        digest = hashlib.md5(base.encode()).hexdigest()[:6]
+        if uid is not None:
+            return f"user{uid}+{digest}@example.test"
+        return f"anon+{digest}@example.test"
+
+    if provider == "person.name":
+        return faker.name()
+
+    if provider == "password.hash":
+        # Random password then bcrypt with configurable rounds
+        pw = faker.password(length=10)
+        return bcrypt.hashpw(pw.encode(), bcrypt.gensalt(rounds=BCRYPT_ROUNDS)).decode()
+
+    if provider == "text.sentence":
+        return faker.sentence(nb_words=8)
+
+    if provider == "date_time_between":
+        p = cfg.get("params", {})
+        return faker.date_time_between(
+            start_date=p.get("start_date", "-2y"),
+            end_date=p.get("end_date", "now")
+        )
+
+    if provider == "pyint":
+        p = cfg.get("params", {})
+        return faker.pyint(
+            min_value=p.get("min", 0),
+            max_value=p.get("max", 1000)
+        )
+
+    if provider == "enum":
+        choices = (cfg.get("params") or {}).get("choices", [])
+        return random.choice(choices) if choices else value
+
+    # Fallback: replace with a simple word to avoid leaking originals
+    return faker.word()
+
+
+def bulk_copy_table(src, dst, table: str, *, mask_cols=None, where_sql="", where_params=()):
+    """Copy table data from src->dst, with optional column masking and filtering."""
+    scur = src.cursor()
+    dcur = dst.cursor()
+
+    cols = colnames(scur, table)
+    id_idx = cols.index("id") if "id" in cols else None
+    col_list = ", ".join([f'"{c}"' for c in cols])
+
+    scur.execute(f'SELECT {col_list} FROM "{table}" {where_sql};', where_params)
+    insert_sql = f'INSERT INTO "{table}" ({col_list}) VALUES %s'
+
+    buf = []
+    for row in scur:
+        row = list(row)
+        if mask_cols:
+            row_ctx = {"id": row[id_idx]} if id_idx is not None else {}
+            for i, c in enumerate(cols):
+                if c in mask_cols:
+                    row[i] = mask_value(table, c, row[i], row_ctx=row_ctx)
+        buf.append(tuple(row))
+        if len(buf) >= BATCH:
+            ex.execute_values(dcur, insert_sql, buf, page_size=BATCH)
+            buf.clear()
+
+    if buf:
+        ex.execute_values(dcur, insert_sql, buf, page_size=BATCH)
+
+
+# ------------------------------
+# Main pipeline
+# ------------------------------
+def main():
+    src_db = os.environ["SRC_DB"]
+    dst_db = os.environ["DST_DB"]
+    dry_limit = os.environ.get("DRY_LIMIT")
+    dry_limit = int(dry_limit) if (dry_limit and dry_limit.strip().isdigit()) else 0
+
+    src = connect(src_db)
+    dst = connect(dst_db)
+
+    # Always start clean to ensure reproducible reruns
+    truncate_all(dst)
+
+    if dry_limit <= 0:
+        print("Copying products...")
+        bulk_copy_table(src, dst, "products")
+        dst.commit()
+
+        print("Masking users...")
+        bulk_copy_table(src, dst, "users", mask_cols=["email", "full_name", "password"])
+        dst.commit()
+
+        print("Copying orders...")
+        bulk_copy_table(src, dst, "orders")
+        dst.commit()
+
+        print("Masking reviews...")
+        bulk_copy_table(src, dst, "reviews", mask_cols=["comment"])
+        dst.commit()
     else:
-        local, domain = email, "example.test"
-    masked_local = hashlib.md5((SALT+local).encode()).hexdigest()[:10] + "." + str(user_id)[-3:]
-    return f"{masked_local}@{domain}"
+        print(f"DRY mode with filtering: limit={dry_limit}")
 
-def get_id_subset(conn, table: str, id_col: str = "id", limit: int = 0):
-    if limit <= 0:
-        return None  # means 'all'
-    with conn.cursor() as c:
-        c.execute(f"SELECT {id_col} FROM {table} ORDER BY {id_col} LIMIT %s", (limit,))
-        return {r[0] for r in c.fetchall()}
+        user_ids = select_ids(src, "users", dry_limit)
+        prod_ids = select_ids(src, "products", dry_limit)
 
-# --- Copy/Mask routines ---
-def copy_table_filtered(src, dst, table: str, cols: list[str], where_sql: str = "", params: tuple = ()):
-    """Generic SELECT (with optional WHERE) -> INSERT, preserves column order."""
-    limit_clause = f" LIMIT {DRY_LIMIT}" if DRY_LIMIT and not params else ""  # when filtering by ids, limit by WHERE set size
-    select_sql = f"SELECT {','.join(cols)} FROM {table} " + (f"WHERE {where_sql} " if where_sql else "") + f"ORDER BY id{limit_clause}"
-    insert_sql = f"INSERT INTO {table} ({','.join(cols)}) VALUES %s"
-    with src.cursor(name=f"{table}_cur") as cur:
-        cur.itersize = BATCH
-        cur.execute(select_sql, params)
-        buf = []
-        with dst.cursor() as dcur:
-            for row in cur:
-                buf.append(tuple(row))
-                if len(buf) >= BATCH:
-                    ex.execute_values(dcur, insert_sql, buf, page_size=BATCH)
-                    buf.clear()
-            if buf:
-                ex.execute_values(dcur, insert_sql, buf, page_size=BATCH)
+        print("Copying products (subset)...")
+        bulk_copy_table(
+            src, dst, "products",
+            where_sql="WHERE id = ANY(%s)",
+            where_params=(prod_ids,),
+        )
+        dst.commit()
 
-def bulk_copy_table(src, dst, table: str):
-    """Full table copy (no WHERE)."""
-    cols = get_columns(src, table)
-    copy_table_filtered(src, dst, table, cols)
+        print("Masking users (subset)...")
+        bulk_copy_table(
+            src, dst, "users",
+            mask_cols=["email", "full_name", "password"],
+            where_sql="WHERE id = ANY(%s)",
+            where_params=(user_ids,),
+        )
+        dst.commit()
 
-def mask_users_subset(src, dst, user_ids: list[int] | None):
-    # users: id, email, full_name, password, is_active, created_at, updated_at
-    where = "id = ANY(%s)" if user_ids is not None else ""
-    params = (list(user_ids),) if user_ids is not None else ()
-    limit_clause = "" if user_ids is not None else (f" LIMIT {DRY_LIMIT}" if DRY_LIMIT else "")
-    select_sql = f"""
-        SELECT id, email, full_name, password, is_active, created_at, updated_at
-        FROM users
-        {(f"WHERE {where}" if where else "")}
-        ORDER BY id{limit_clause}
-    """
-    insert_sql = """INSERT INTO users
-                    (id, email, full_name, password, is_active, created_at, updated_at)
-                    VALUES %s"""
-    template = "(%s,%s,%s, crypt('Test1234!', gen_salt('bf')) ,%s,%s,%s)"
-    with src.cursor(name="users_cur") as cur:
-        cur.itersize = BATCH
-        cur.execute(select_sql, params)
-        buf = []
-        with dst.cursor() as dcur:
-            for uid, email, full_name, password, is_active, created_at, updated_at in cur:
-                buf.append((
-                    uid,
-                    mask_email(email or "", uid),
-                    fk.name(),
-                    # password replaced via SQL crypt() in template
-                    is_active, created_at, updated_at
-                ))
-                if len(buf) >= BATCH:
-                    ex.execute_values(dcur, insert_sql, buf, template=template, page_size=BATCH)
-                    buf.clear()
-            if buf:
-                ex.execute_values(dcur, insert_sql, buf, template=template, page_size=BATCH)
+        print("Copying orders (filtered)...")
+        bulk_copy_table(
+            src, dst, "orders",
+            where_sql="WHERE user_id = ANY(%s) AND product_id = ANY(%s)",
+            where_params=(user_ids, prod_ids),
+        )
+        dst.commit()
 
-def mask_reviews_subset(src, dst, rev_cols: list[str], user_ids: list[int] | None, product_ids: list[int] | None):
-    has_comment = "comment" in rev_cols
-    if user_ids is not None and product_ids is not None:
-        where = "user_id = ANY(%s) AND product_id = ANY(%s)"
-        params = (list(user_ids), list(product_ids))
-    else:
-        where = ""
-        params = ()
-    limit_clause = "" if where else (f" LIMIT {DRY_LIMIT}" if DRY_LIMIT else "")
-    select_sql = "SELECT " + ",".join(rev_cols) + f" FROM reviews " + (f"WHERE {where} " if where else "") + f"ORDER BY id{limit_clause}"
-    insert_sql = f"INSERT INTO reviews ({','.join(rev_cols)}) VALUES %s"
-    with src.cursor(name="reviews_cur") as cur:
-        cur.itersize = BATCH
-        cur.execute(select_sql, params)
-        buf = []
-        with dst.cursor() as dcur:
-            for row in cur:
-                row = list(row)
-                if has_comment:
-                    i = rev_cols.index("comment")
-                    row[i] = fk.paragraph(nb_sentences=3)
-                buf.append(tuple(row))
-                if len(buf) >= BATCH:
-                    ex.execute_values(dcur, insert_sql, buf, page_size=BATCH)
-                    buf.clear()
-            if buf:
-                ex.execute_values(dcur, insert_sql, buf, page_size=BATCH)
+        print("Masking reviews (filtered)...")
+        bulk_copy_table(
+            src, dst, "reviews",
+            mask_cols=["comment"],
+            where_sql="WHERE user_id = ANY(%s) AND product_id = ANY(%s)",
+            where_params=(user_ids, prod_ids),
+        )
+        dst.commit()
 
-def write_audit(dst):
+    # Write audit row
     with dst.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS masking_audit (
-                id serial PRIMARY KEY,
-                ran_at timestamptz DEFAULT now(),
-                source_db text,
-                masked_tables jsonb
-            )
+                ran_at TIMESTAMPTZ,
+                source_db TEXT,
+                masked_tables TEXT[]
+            );
         """)
-        cur.execute("""
-            INSERT INTO masking_audit (source_db, masked_tables)
-            VALUES (%s, %s)
-        """, (SRC_DB, json.dumps({
-            "users":  ["email","full_name","password -> crypt(Test1234!)"],
-            "reviews":["comment"]
-        })))
+        cur.execute(
+            "INSERT INTO masking_audit (ran_at, source_db, masked_tables) VALUES (%s, %s, %s);",
+            (datetime.now(timezone.utc), src_db, ["users", "products", "orders", "reviews"])
+        )
     dst.commit()
 
-# --- Main orchestration ---
-def main():
-    src = connect(SRC_DB); dst = connect(DST_DB)
-    try:
-        # Grab column lists once
-        prod_cols = get_columns(src, "products")
-        ord_cols  = get_columns(src, "orders")
-        rev_cols  = get_columns(src, "reviews")
+    print("Done.")
 
-        if DRY_LIMIT:
-            # Build consistent subsets to avoid FK violations
-            user_ids = get_id_subset(src, "users", "id", DRY_LIMIT)
-            prod_ids = get_id_subset(src, "products", "id", DRY_LIMIT)
-            print(f"DRY mode: limiting to {DRY_LIMIT} users/products and filtering dependent rows.")
-
-            # 1) products subset
-            print("Copying products (subset)...")
-            copy_table_filtered(src, dst, "products", prod_cols, "id = ANY(%s)", (list(prod_ids),))
-            dst.commit()
-
-            # 2) users subset (masked)
-            print("Masking users (subset)...")
-            mask_users_subset(src, dst, list(user_ids))
-            dst.commit()
-
-            # 3) orders filtered to chosen users/products
-            print("Copying orders (filtered)...")
-            copy_table_filtered(
-                src, dst, "orders", ord_cols,
-                "user_id = ANY(%s) AND product_id = ANY(%s)",
-                (list(user_ids), list(prod_ids))
-            )
-            dst.commit()
-
-            # 4) reviews filtered (masked)
-            print("Masking reviews (filtered)...")
-            mask_reviews_subset(src, dst, rev_cols, list(user_ids), list(prod_ids))
-            dst.commit()
-
-        else:
-            # Full dataset in FK-safe order
-            print("Copying products..."); bulk_copy_table(src, dst, "products"); dst.commit()
-            print("Masking users...");    mask_users_subset(src, dst, None);    dst.commit()
-            print("Copying orders...");   bulk_copy_table(src, dst, "orders");  dst.commit()
-            print("Masking reviews...");  mask_reviews_subset(src, dst, rev_cols, None, None); dst.commit()
-
-        print("Writing audit..."); write_audit(dst)
-        print("Done.")
-    finally:
-        src.close(); dst.close()
 
 if __name__ == "__main__":
     main()

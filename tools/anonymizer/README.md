@@ -1,95 +1,147 @@
-# 🧪 Test Data Hackathon
 
-Welcome to the **Test Data Hackathon**! This internal event is designed to tackle two of the most pressing challenges in Test Data Management (TDM): **synthetic data generation** and **data masking/anonymization**. You’ll be working with a sample e-commerce-like codebase involving users, products, orders, and reviews. The main goal is to create test data generation and anonymization solutions that enhance integration testing reliability, privacy compliance, and developer productivity.
+# 🛡️ Database Anonymizer & Test Data Generator  
 
-## 📘 Codebase Overview
+![Python](https://img.shields.io/badge/Python-3.12-blue.svg) ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg) ![Hackathon](https://img.shields.io/badge/Test%20Data-Hackathon%202025-orange.svg)  
 
-The codebase contains four core models:
+**Easily anonymize databases for safe testing while keeping schema & integrity intact.**  
 
-- **User**
-  - Fields: `email`, `full_name`, `password`, `is_active`, timestamps
-  - Relationships: Has many `orders` and `reviews`
-  - PII fields: `email`, `full_name`, `password`
+A lightweight framework to anonymize sensitive database records while preserving structure, integrity, and usefulness for testing.  
+Built during the **Test Data Hackathon 2025**, this project masks real data with Faker-generated substitutes, validates referential integrity, and provides reproducible runs.  
 
-- **Product**
-  - Fields: `name`, `description`, `price`, `category`, `stock`
-  - Relationships: Has many `orders` and `reviews`
+---
 
-- **Order**
-  - Fields: `user_id`, `product_id`, `quantity`, `total_price`, `status`, timestamps
-  - Relationships: Belongs to `user` and `product`
+## 🚀 Quickstart  
 
-- **Review**
-  - Fields: `user_id`, `product_id`, `rating`, `comment`, timestamps
-  - Relationships: Belongs to `user` and `product`
-  - Notes: A user may only leave one review per product
+Clone the repo and run the reproducible script:  
 
-## 🧩 Hackathon Exercises
+    git clone https://github.com/your-org/anonymizer.git
+    cd anonymizer
+    ./reproducible_run.sh
 
-### 🔧 Exercise 1: Synthetic Data Generation
+This will:  
+1. Create a `.venv` and install dependencies from `requirements.txt`.  
+2. Ensure the masked DB schema exists.  
+3. Run the anonymization pipeline (`mask_db.py`).  
+4. Validate results (row counts, foreign keys, email checks).  
+5. Log an audit record of the masking operation.  
 
-Create a Python tool to populate the database with **realistic, varied, and reproducible synthetic data** for all four models.
+---
 
-#### 🔍 Requirements:
+## 🔍 Examples  
 
-- Generate consistent and linked data:
-  - Users who have placed orders
-  - Products that are reviewed
-  - Orders referencing valid users/products
-  - Respect unique and foreign key constraints
-- Allow test scenarios such as:
-  - Users with 0, 1, or many orders/reviews
-  - Products with high/low/no stock
-  - Orders with edge-case status or large quantities
-- Seed-based reproducibility.
+### Row Counts (Original vs Masked)  
 
-#### Advanced Ideas:
+    tbl    | count 
+    ----------+-------
+    orders   | 29240
+    products | 20000
+    reviews  | 60043
+    users    | 10000
 
-- Add CLI support (e.g., `python generate.py --users 100 --orders 500`).
-- Support config files (YAML/JSON) for data shape.
+### Users Table – Before & After Masking  
 
-### 🔐 Exercise 2: Data Masking and Anonymization
+Original  
 
-Build a tool to **anonymize production data** while maintaining structure and utility for integration testing.
+    id |            email             |   full_name    | pw_prefix  
+    ----+------------------------------+----------------+------------
+     1 | melindasmith@example.org     | Kathy Davis    | S^8UQNh!)v
+     2 | cunninghamrachel@example.org | David Finley   | n1&4LvCpir
 
-#### Requirements:
+Masked  
 
-- Identify and transform sensitive fields:
-  - `User.email`, `User.full_name`, `User.password`
-  - Any comments in `Review.comment`
-- Techniques to support:
-  - Faker-based substitutions
-  - Shuffling or hashing identifiers
-  - Nulling or format-preserving obfuscation
-- Maintain referential integrity across models.
-- Log or report what was masked.
+    id |           email           |     full_name      | pw_prefix  
+    ----+---------------------------+--------------------+------------
+     1 | user1+07df79@example.test | Jessica Smith      | $2b$04$g/9
+     2 | user2+48f174@example.test | Danielle Contreras | $2b$04$ysM
 
-#### Edge Cases to Handle:
+---
 
-- Ensure masked `email` fields remain unique.
-- Preserve correct foreign key relationships.
-- Avoid breaking the `user_id`/`product_id` links in `Order` and `Review`.
+## 🧪 Smoke Test  
 
-### 🧰 Suggested Tools & Libraries
-| Task                  | Tools                                                  |
-| --------------------- | ------------------------------------------------------ |
-| Synthetic Generation  | Faker, Hypothesis, pydbgen, NumPy, Pandas              |
-| Anonymization         | Pandas, Faker, Presidio, anonymizedf, re, cryptography |
+Run a quick subset anonymization in “dry mode” to verify masking:  
 
-### 🧪 Testing and Integration
+    python smoke_test.py --limit 100000
 
-Run pytest after data generation to ensure relational and integrity constraints.
-Validate anonymization:
-- No original emails or names in the output
-- Referential links intact
-- Consider generating a data_audit.json for logs.
+Sample output:  
 
-## 👥 Team Collaboration
+    === Sanity checks (masked DB) ===
+    {
+      "row_counts": {
+        "users": 10000,
+        "products": 20000,
+        "orders": 29240,
+        "reviews": 60043
+      },
+      "email_dupes": 0,
+      "email_invalid": 0,
+      "orphans": {
+        "orders_user": 0,
+        "orders_product": 0,
+        "reviews_user": 0,
+        "reviews_product": 0
+      }
+    }
 
-Each team owns their implementation of the exercises. Collaboration and cross-pollination of ideas are encouraged!
+✅ Confirms row counts match, no duplicates, no invalid emails, and no broken foreign keys.  
 
-## 📄 License
+---
 
-Internal Use Only – Confidential.
+## 🏗️ Architecture  
 
-Let’s build something impactful. Happy hacking! 🚀
+    ┌──────────────┐       ┌──────────────┐
+    │              │       │              │
+    │  Source DB   │──────▶│  mask_db.py  │
+    │ (hackathon)  │       │ (anonymizer) │
+    │              │       │              │
+    └───────┬──────┘       └──────┬──────┘
+            │                     │
+            │  masked tables      │
+            ▼                     ▼
+    ┌──────────────┐       ┌──────────────┐
+    │              │       │              │
+    │  Masked DB   │──────▶│  Validation  │
+    │ (safe to use)│       │ (row counts, │
+    │              │       │  FKs, audit) │
+    └──────────────┘       └──────────────┘
+
+Flow:  
+1. Copy schema & data from Source DB.  
+2. Replace sensitive fields with Faker / hashed values.  
+3. Write anonymized records into Masked DB.  
+4. Run validation checks and store an audit record.  
+
+---
+
+## ⚙️ Configuration  
+
+Masking rules are defined in `faker_mapping.yaml`.  
+This file maps database columns to Faker providers or hashing functions. Example:  
+
+    users:
+      email: faker.email
+      full_name: faker.name
+      pw_prefix: bcrypt
+    reviews:
+      comment_snippet: faker.text
+
+You can extend this mapping with any supported Faker providers or custom functions.  
+
+---
+
+## 🤝 Contributing  
+
+This project was developed for the **Test Data Hackathon 2025**. Contributions are welcome!  
+
+- Issues: Use GitHub Issues to report bugs or request features.  
+- Pull Requests: Fork the repo, create a feature branch, and open a PR.  
+- Hackathon context: Focus was on anonymization, reproducibility, and validation. Future work may include:  
+  - FastAPI API endpoints for on-demand anonymization.  
+  - Support for more DB backends.  
+  - Configurable seeding for deterministic masking.  
+
+---
+
+## 📜 License  
+
+MIT License — simple and permissive.  
+See the LICENSE file for full text.  
