@@ -1,147 +1,109 @@
+# Anonymizer
 
-# 🛡️ Database Anonymizer & Test Data Generator  
-
-![Python](https://img.shields.io/badge/Python-3.12-blue.svg) ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg) ![Hackathon](https://img.shields.io/badge/Test%20Data-Hackathon%202025-orange.svg)  
-
-**Easily anonymize databases for safe testing while keeping schema & integrity intact.**  
-
-A lightweight framework to anonymize sensitive database records while preserving structure, integrity, and usefulness for testing.  
-Built during the **Test Data Hackathon 2025**, this project masks real data with Faker-generated substitutes, validates referential integrity, and provides reproducible runs.  
+The **Anonymizer** connects to a Postgres database, inspects schema and metadata, and produces a **GDPR compliance + data quality report**.
 
 ---
 
-## 🚀 Quickstart  
+## ✨ Features
 
-Clone the repo and run the reproducible script:  
-
-    git clone https://github.com/your-org/anonymizer.git
-    cd anonymizer
-    ./reproducible_run.sh
-
-This will:  
-1. Create a `.venv` and install dependencies from `requirements.txt`.  
-2. Ensure the masked DB schema exists.  
-3. Run the anonymization pipeline (`mask_db.py`).  
-4. Validate results (row counts, foreign keys, email checks).  
-5. Log an audit record of the masking operation.  
-
----
-
-## 🔍 Examples  
-
-### Row Counts (Original vs Masked)  
-
-    tbl    | count 
-    ----------+-------
-    orders   | 29240
-    products | 20000
-    reviews  | 60043
-    users    | 10000
-
-### Users Table – Before & After Masking  
-
-Original  
-
-    id |            email             |   full_name    | pw_prefix  
-    ----+------------------------------+----------------+------------
-     1 | melindasmith@example.org     | Kathy Davis    | S^8UQNh!)v
-     2 | cunninghamrachel@example.org | David Finley   | n1&4LvCpir
-
-Masked  
-
-    id |           email           |     full_name      | pw_prefix  
-    ----+---------------------------+--------------------+------------
-     1 | user1+07df79@example.test | Jessica Smith      | $2b$04$g/9
-     2 | user2+48f174@example.test | Danielle Contreras | $2b$04$ysM
+- **Primary keys, foreign keys, indexes** detection  
+- **Column profiling**:
+  - Type, nullability, default values
+  - Null fraction, distinctness, most common values
+- **PII likelihood** heuristic:
+  - High → emails, names, free text
+  - Medium → descriptive/categorical fields
+  - Low → numeric, dates, booleans
+- **Top risks summary**:
+  - High-null columns
+  - Potential PII
+  - Low-distinctness fields
 
 ---
 
-## 🧪 Smoke Test  
+## 🚀 Quickstart
 
-Run a quick subset anonymization in “dry mode” to verify masking:  
+### Linux / macOS
 
-    python smoke_test.py --limit 100000
+```bash
+# copy example env and edit with DB creds
+cp ../../.env.example .env
 
-Sample output:  
+# run tests
+./test.sh
 
-    === Sanity checks (masked DB) ===
+# run smoke test
+python smoke_test.py
+```
+
+### Windows (PowerShell)
+
+```powershell
+# copy env file
+copy ..\..\.env.example .env
+
+# set environment variables (example)
+$env:PGHOST="127.0.0.1"
+$env:PGPORT="55433"
+$env:PGUSER="hackathon_user"
+$env:PGPASSWORD="hackathon_pass"
+$env:SRC_DB="hackathon_db"
+$env:SCHEMAS="public"
+
+# run tests (requires Git Bash)
+bash test.sh
+
+# or run smoke test directly
+python smoke_test.py
+```
+
+👉 On Windows you need **Git Bash** (bundled with Git for Windows) or **WSL2** to run `test.sh`.  
+If neither is available, manually reproduce the script’s steps in PowerShell.
+
+---
+
+## 📝 Example Output
+
+JSON snippet:
+
+```json
+{
+  "db": "hackathon_db",
+  "schemas": ["public"],
+  "tables": [
     {
-      "row_counts": {
-        "users": 10000,
-        "products": 20000,
-        "orders": 29240,
-        "reviews": 60043
-      },
-      "email_dupes": 0,
-      "email_invalid": 0,
-      "orphans": {
-        "orders_user": 0,
-        "orders_product": 0,
-        "reviews_user": 0,
-        "reviews_product": 0
-      }
+      "schema": "public",
+      "table": "users",
+      "columns": [
+        {"name": "email", "type": "character varying", "pii_likelihood": "high"},
+        {"name": "full_name", "type": "character varying", "pii_likelihood": "high"},
+        {"name": "password", "type": "character varying", "pii_likelihood": "medium"}
+      ],
+      "primary_key": ["id"],
+      "foreign_keys": [],
+      "indexes": [...]
     }
-
-✅ Confirms row counts match, no duplicates, no invalid emails, and no broken foreign keys.  
-
----
-
-## 🏗️ Architecture  
-
-    ┌──────────────┐       ┌──────────────┐
-    │              │       │              │
-    │  Source DB   │──────▶│  mask_db.py  │
-    │ (hackathon)  │       │ (anonymizer) │
-    │              │       │              │
-    └───────┬──────┘       └──────┬──────┘
-            │                     │
-            │  masked tables      │
-            ▼                     ▼
-    ┌──────────────┐       ┌──────────────┐
-    │              │       │              │
-    │  Masked DB   │──────▶│  Validation  │
-    │ (safe to use)│       │ (row counts, │
-    │              │       │  FKs, audit) │
-    └──────────────┘       └──────────────┘
-
-Flow:  
-1. Copy schema & data from Source DB.  
-2. Replace sensitive fields with Faker / hashed values.  
-3. Write anonymized records into Masked DB.  
-4. Run validation checks and store an audit record.  
+  ],
+  "top_risks": {
+    "high_null_rate_columns": ["public.users.updated_at (null_frac=1.00)"],
+    "potential_pii_columns": ["public.users.email", "public.users.full_name"]
+  }
+}
+```
 
 ---
 
-## ⚙️ Configuration  
+## 🔐 GDPR Use Cases
 
-Masking rules are defined in `faker_mapping.yaml`.  
-This file maps database columns to Faker providers or hashing functions. Example:  
-
-    users:
-      email: faker.email
-      full_name: faker.name
-      pw_prefix: bcrypt
-    reviews:
-      comment_snippet: faker.text
-
-You can extend this mapping with any supported Faker providers or custom functions.  
+- Identify and mask **PII columns** before exporting test data.  
+- Share **masked schemas** with developers/testers safely.  
+- Support **DSAR / Right to be Forgotten** workflows by knowing where PII resides.  
+- Maintain **privacy by design** in test data pipelines.
 
 ---
 
-## 🤝 Contributing  
+## ⚡ Tips
 
-This project was developed for the **Test Data Hackathon 2025**. Contributions are welcome!  
-
-- Issues: Use GitHub Issues to report bugs or request features.  
-- Pull Requests: Fork the repo, create a feature branch, and open a PR.  
-- Hackathon context: Focus was on anonymization, reproducibility, and validation. Future work may include:  
-  - FastAPI API endpoints for on-demand anonymization.  
-  - Support for more DB backends.  
-  - Configurable seeding for deterministic masking.  
-
----
-
-## 📜 License  
-
-MIT License — simple and permissive.  
-See the LICENSE file for full text.  
+- Re-run `smoke_test.py` after masking to verify no PII is left.  
+- Use `\dt` in `psql` to confirm table names if queries fail.  
+- For Windows, prefer **Git Bash** or **WSL2** for best compatibility.
