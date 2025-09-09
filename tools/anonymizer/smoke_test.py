@@ -1,477 +1,458 @@
 #!/usr/bin/env python3
 """
-tools/anonymizer/smoke_test.py
+smoke_test.py — Prod DB Insight (schema-first, metadata-only, zero raw data)
 
-End-to-end smoke test:
-- Loads .env if present
-- Connects to source & masked DBs
-- Resets masked DB, runs mask_db.py with DRY_LIMIT (subset) or full copy
-- Performs sanity checks
-- Optional deep profiling (schema-level stats; NO raw values)
-- Optional AI summary via OpenAI
+What this does:
+  • Connects to the SOURCE (prod) database defined by env vars
+  • Reads Postgres metadata (pg_catalog, information_schema, pg_stats)
+  • Produces an executive summary:
+      - Tables by size & estimated rows
+      - Columns (type, nullability, default) + PII likelihood heuristic
+      - PKs, FKs, indexes
+      - Data-quality signals from pg_stats (null_frac, n_distinct, MCVs)
+      - Top risks (high nulls, low distinctness, potential PII)
+  • Outputs JSON (default) or Markdown (--format md)
+  • No table scans; no raw values; very fast & safe
 
-Usage:
-  python smoke_test.py [--limit 200] [--deep] [--ai]
+Env vars (same as your project):
+  PGHOST, PGPORT, PGUSER, PGPASSWORD, SRC_DB  (required)
+Optional:
+  SCHEMAS   comma-separated, default "public"
+  TZ        timezone label for generated_at, default "UTC"
+
+Usage examples:
+  python smoke_test.py --prod-insight
+  python smoke_test.py --prod-insight --schema-only
+  python smoke_test.py --prod-insight --format md > prod_insight.md
+  SCHEMAS=public,analytics python smoke_test.py --prod-insight
+
+Windows:
+  py smoke_test.py --prod-insight
+
+Requires: psycopg2 (already in your requirements)
+Optionally uses: python-dotenv (auto-load .env if available)
 """
 
 from __future__ import annotations
-
 import os
-import sys
+import re
 import json
 import argparse
-import subprocess
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Dict, Any, List, Tuple
+
+# Optional .env loading (non-fatal if missing)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 import psycopg2
 import psycopg2.extras as ex
 
 
-# -----------------------------
-# Env helpers
-# -----------------------------
-def load_dotenv_from_here():
-    """Load .env if present in the current directory (tools/anonymizer)."""
-    if os.path.exists(".env"):
-        with open(".env") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
+# ---------- Utilities ----------
 
+def get_schemas_from_env() -> List[str]:
+    raw = os.environ.get("SCHEMAS", "public")
+    return [s.strip() for s in raw.split(",") if s.strip()]
 
-def env(key, default=None, required=False):
-    val = os.environ.get(key, default)
-    if required and (val is None or val == ""):
-        print(f"❌ Missing required env var: {key}", file=sys.stderr)
-        sys.exit(1)
-    return val
+def now_iso() -> str:
+    tzlabel = os.environ.get("TZ", "UTC")
+    return f"{datetime.now(timezone.utc).isoformat()} ({tzlabel})"
 
+def prod_conn():
+    dsn = {
+        "host": os.environ.get("PGHOST", "localhost"),
+        "port": int(os.environ.get("PGPORT", 5432)),
+        "user": os.environ.get("PGUSER"),
+        "password": os.environ.get("PGPASSWORD"),
+        "dbname": os.environ["SRC_DB"],   # raises KeyError if missing -> clearer failure
+    }
 
-# -----------------------------
-# DB helpers
-# -----------------------------
-def connect(dbname):
-    return psycopg2.connect(
-        host=env("PGHOST", "127.0.0.1"),
-        port=env("PGPORT", "5432"),
-        user=env("PGUSER", "postgres"),
-        password=env("PGPASSWORD", ""),
-        dbname=dbname,
-    )
+  # Print all values
+    print(">>> Effective DB Connection Settings:")
+    for k, v in dsn.items():
+        print(f"    {k:8s} = {v}")
+    return psycopg2.connect(**dsn)
 
-
-def one_value(conn, sql, params=None):
-    with conn.cursor() as cur:
-        if params is not None:
-            cur.execute(sql, params)
-        else:
-            cur.execute(sql)
-        row = cur.fetchone()
-        return row[0] if row else None
-
-
-def rows(conn, sql, params=None):
+def qall(conn, sql: str, params=None) -> List[Dict[str, Any]]:
     with conn.cursor(cursor_factory=ex.RealDictCursor) as cur:
-        if params is not None:
-            cur.execute(sql, params)
-        else:
-            cur.execute(sql)
+        cur.execute(sql, params or {})
         return cur.fetchall()
 
 
-def reset_masked_db(dbname):
-    conn = connect(dbname)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE reviews, orders, users, products RESTART IDENTITY CASCADE;")
-        conn.commit()
-    finally:
-        conn.close()
+# ---------- Metadata Queries (fast, no scans) ----------
+
+def q_tables(conn, schemas: List[str]):
+    sql = """
+    SELECT n.nspname AS schema,
+           c.relname AS table,
+           COALESCE(c.reltuples, 0)::bigint AS row_est,
+           pg_relation_size(c.oid) AS rel_bytes,
+           pg_total_relation_size(c.oid) AS total_bytes
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'r'
+      AND n.nspname = ANY(%s)
+    ORDER BY total_bytes DESC, n.nspname, c.relname;
+    """
+    return qall(conn, sql, (schemas,))
 
 
-def has_table(conn, table: str) -> bool:
-    return bool(
-        one_value(
-            conn,
-            """
-            SELECT COUNT(*) FROM information_schema.tables
-            WHERE table_schema='public' AND table_name=%s;
-            """,
-            (table,),
-        )
-    )
+
+def _normalize_aliases(rows):
+    """Ensure rows have 'schema', 'table', 'column' keys even if queries used schema_name/table_name/column_name."""
+    normed = []
+    for r in rows:
+        if isinstance(r, dict):
+            rr = dict(r)
+            if 'schema' not in rr and 'schema_name' in rr:
+                rr['schema'] = rr['schema_name']
+            if 'table' not in rr and 'table_name' in rr:
+                rr['table'] = rr['table_name']
+            if 'column' not in rr and 'column_name' in rr:
+                rr['column'] = rr['column_name']
+            if 'ref_schema' not in rr and 'ref_schema_name' in rr:
+                rr['ref_schema'] = rr['ref_schema_name']
+            if 'ref_table' not in rr and 'ref_table_name' in rr:
+                rr['ref_table'] = rr['ref_table_name']
+            if 'ref_column' not in rr and 'ref_column_name' in rr:
+                rr['ref_column'] = rr['ref_column_name']
+            normed.append(rr)
+        else:
+            normed.append(r)
+    return normed
+
+def q_columns(conn, schemas: List[str]):
+    sql = """
+    SELECT table_schema AS schema,
+           table_name   AS table,
+           column_name,
+           data_type,
+           is_nullable,
+           column_default
+    FROM information_schema.columns
+    WHERE table_schema = ANY(%s)
+    ORDER BY table_schema, table_name, ordinal_position;
+    """
+    return qall(conn, sql, (schemas,))
+
+def q_foreign_keys(conn, schemas: List[str]):
+    sql = """
+    SELECT
+      tc.constraint_schema AS schema_name,
+      tc.table_name        AS table_name,
+      kcu.column_name      AS column_name,
+      ccu.table_schema     AS ref_schema_name,
+      ccu.table_name       AS ref_table_name,
+      ccu.column_name      AS ref_column_name,
+      rc.update_rule,
+      rc.delete_rule
+    FROM information_schema.table_constraints tc
+    JOIN information_schema.key_column_usage kcu
+      ON tc.constraint_name = kcu.constraint_name
+     AND tc.table_schema = kcu.table_schema
+     AND tc.table_name   = kcu.table_name
+    JOIN information_schema.referential_constraints rc
+      ON rc.constraint_name = tc.constraint_name
+     AND rc.constraint_schema = tc.constraint_schema
+    JOIN information_schema.constraint_column_usage ccu
+      ON ccu.constraint_name = rc.unique_constraint_name
+     AND ccu.constraint_schema = rc.unique_constraint_schema
+    WHERE tc.constraint_type = 'FOREIGN KEY'
+      AND tc.table_schema = ANY(%s)
+    ORDER BY schema_name, table_name, column_name;
+    """
+    return qall(conn, sql, (schemas,))
+
+def q_indexes(conn, schemas: List[str]):
+    sql = """
+    SELECT n.nspname AS schema, c.relname AS table, i.relname AS index,
+           pg_relation_size(i.oid) AS idx_bytes,
+           ix.indisunique, ix.indisvalid
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_index ix ON ix.indrelid = c.oid
+    JOIN pg_class i ON i.oid = ix.indexrelid
+    WHERE c.relkind = 'r'
+      AND n.nspname = ANY(%s)
+    ORDER BY idx_bytes DESC, n.nspname, c.relname;
+    """
+    return qall(conn, sql, (schemas,))
+
+def q_pg_stats(conn, schemas: List[str]):
+    sql = """
+    SELECT schemaname AS schema,
+           tablename  AS table,
+           attname    AS column,
+           null_frac,
+           n_distinct,
+           most_common_vals,
+           most_common_freqs
+    FROM pg_stats
+    WHERE schemaname = ANY(%s)
+    ORDER BY schemaname, tablename, attname;
+    """
+    return qall(conn, sql, (schemas,))
 
 
-def list_tables(conn) -> List[str]:
-    rs = rows(
-        conn,
-        """
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema='public'
-        ORDER BY table_name;
-        """,
-    )
-    return [r["table_name"] for r in rs]
+# ---------- Heuristics & Summaries ----------
 
+PII_PATTERN = re.compile(
+    r"(email|e-mail|mail|name|firstname|lastname|surname|phone|mobile|msisdn|"
+    r"address|street|postcode|zipcode|zip|iban|bic|card|cc|pan|ssn|dob|birth|passport)",
+    re.IGNORECASE
+)
 
-def list_columns(conn, table) -> List[Dict[str, Any]]:
-    return rows(
-        conn,
-        """
-        SELECT column_name, data_type
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name=%s
-        ORDER BY ordinal_position;
-        """,
-        (table,),
-    )
+def pii_likelihood(col_name: str, data_type: str | None) -> str:
+    score = 0
+    if PII_PATTERN.search(col_name or ""):
+        score += 2
+    if data_type and data_type.lower() in ("text", "character varying", "citext"):
+        score += 1
+    # 0=low, 1=medium, 2+=high
+    return ("low", "medium", "high")[min(score, 2)]
 
+def summarize_pg_stat(stat_row: Dict[str, Any]) -> Dict[str, Any]:
+    nd = stat_row.get("n_distinct")
+    distinct_desc = None
+    if nd is not None:
+        if nd > 0:
+            distinct_desc = f"~{int(nd)} distinct"
+        elif nd < 0:
+            # negative means fraction of rows: -0.5 => 50% distinct
+            distinct_desc = f"{abs(nd):.2f}× rows (distinctness fraction)"
+    return {
+        "null_frac": stat_row.get("null_frac"),
+        "distinctness": distinct_desc,
+        "mcv_present": bool(stat_row.get("most_common_vals")),
+    }
 
-def is_textual(pg_type: str) -> bool:
-    return pg_type in {"text", "character varying", "character", "varchar", "char", "citext"}
+def risk_rank_tables(tables: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # Simple ranking: largest tables first
+    return sorted(tables, key=lambda t: (t.get("size_bytes", 0), t.get("row_est", 0)), reverse=True)
 
+def detect_top_risks(tables: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    high_nulls = []
+    low_distinct = []
+    pii_hotspots = []
 
-def is_numeric(pg_type: str) -> bool:
-    return pg_type in {
-        "smallint",
-        "integer",
-        "bigint",
-        "decimal",
-        "numeric",
-        "real",
-        "double precision",
+    for t in tables:
+        tname = f'{t["schema"]}.{t["table"]}'
+        for c in t.get("columns", []):
+            q = c.get("quality", {})
+            nf = q.get("null_frac")
+            if isinstance(nf, (int, float)) and nf >= 0.30:
+                high_nulls.append(f"{tname}.{c['name']} (null_frac={nf:.2f})")
+
+            dist = q.get("distinctness") or ""
+            if "distinctness fraction" in dist:
+                # parse like "0.05× rows (distinctness fraction)"
+                try:
+                    frac = float(dist.split("×")[0])
+                    if frac <= 0.10:
+                        low_distinct.append(f"{tname}.{c['name']} (~{frac:.2f} distinct)")
+                except Exception:
+                    pass
+
+            if c.get("pii_likelihood") == "high":
+                pii_hotspots.append(f"{tname}.{c['name']} ({c.get('type','')})")
+
+    return {
+        "high_null_rate_columns": sorted(high_nulls)[:25],
+        "low_distinctness_columns": sorted(low_distinct)[:25],
+        "potential_pii_columns": sorted(pii_hotspots)[:25],
     }
 
 
-def is_temporal(pg_type: str) -> bool:
-    return pg_type in {
-        "date",
-        "timestamp without time zone",
-        "timestamp with time zone",
-        "time without time zone",
-        "time with time zone",
+# ---------- Builder ----------
+
+
+
+def q_primary_keys(conn, schemas):
+    sql = """
+    SELECT
+        tc.table_schema      AS schema_name,
+        tc.table_name        AS table_name,
+        kcu.column_name      AS column_name,
+        kcu.ordinal_position AS ordinal_position,
+        tc.constraint_name   AS constraint_name
+    FROM information_schema.table_constraints AS tc
+    JOIN information_schema.key_column_usage AS kcu
+      ON tc.constraint_name = kcu.constraint_name
+     AND tc.table_schema = kcu.table_schema
+     AND tc.table_name   = kcu.table_name
+    WHERE tc.constraint_type = 'PRIMARY KEY'
+      AND tc.table_schema = ANY(%s)
+    ORDER BY tc.table_schema, tc.table_name, kcu.ordinal_position;
+    """
+    return qall(conn, sql, (schemas,))
+
+def build_prod_insight(conn, schemas: List[str], schema_only: bool = False) -> Dict[str, Any]:
+    tables = q_tables(conn, schemas)
+    tables = _normalize_aliases(tables)
+    columns = q_columns(conn, schemas)
+    columns = _normalize_aliases(columns)
+    pks = q_primary_keys(conn, schemas)
+    pks = _normalize_aliases(pks)
+    fks = q_foreign_keys(conn, schemas)
+    fks = _normalize_aliases(fks)
+    idxs = q_indexes(conn, schemas)
+    idxs = _normalize_aliases(idxs)
+
+    # Organize by table key
+    by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for t in tables:
+        key = (t["schema"], t["table"])
+        by_key[key] = {
+            "schema": t["schema"],
+            "table": t["table"],
+            "row_est": int(t.get("row_est", 0)),
+            "size_bytes": int(t.get("total_bytes", 0)),
+            "columns": [],
+            "primary_key": [],
+            "foreign_keys": [],
+            "indexes": [],
+        }
+
+    for c in columns:
+        key = (c["schema"], c["table"])
+        if key in by_key:
+            by_key[key]["columns"].append({
+                "name": c["column_name"],
+                "type": c["data_type"],
+                "nullable": (c["is_nullable"] == "YES"),
+                "default": c["column_default"],
+                "pii_likelihood": pii_likelihood(c["column_name"], c["data_type"]),
+            })
+
+    for p in pks:
+        key = (p["schema"], p["table"])
+        if key in by_key:
+            by_key[key]["primary_key"].append(p["column"])
+
+    for f in fks:
+        key = (f["schema"], f["table"])
+        if key in by_key:
+            by_key[key]["foreign_keys"].append({
+                "column": f["column"],
+                "ref": f'{f["ref_schema"]}.{f["ref_table"]}.{f["ref_column"]}',
+                "on_update": f["update_rule"],
+                "on_delete": f["delete_rule"],
+            })
+
+    for i in idxs:
+        key = (i["schema"], i["table"])
+        if key in by_key:
+            by_key[key]["indexes"].append({
+                "name": i["index"],
+                "bytes": int(i["idx_bytes"]),
+                "unique": bool(i["indisunique"]),
+                "valid": bool(i["indisvalid"]),
+            })
+
+    tables_out = list(by_key.values())
+    # Short-circuit if schema only
+    if schema_only:
+        return {
+            "generated_at": now_iso(),
+            "db": os.environ.get("SRC_DB"),
+            "schemas": schemas,
+            "tables": risk_rank_tables(tables_out),
+            "top_risks": {"note": "Skipped (schema-only)"},
+        }
+
+    # Attach pg_stats
+    stats = q_pg_stats(conn, schemas)
+    stats_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for s in stats:
+        stats_map.setdefault((s["schema"], s["table"]), {})[s["column"]] = s
+
+    for t in tables_out:
+        per_col = stats_map.get((t["schema"], t["table"]), {})
+        cols_new = []
+        for c in t["columns"]:
+            sc = per_col.get(c["name"])
+            c2 = dict(c)
+            if sc:
+                c2["quality"] = summarize_pg_stat(sc)
+            cols_new.append(c2)
+        t["columns"] = cols_new
+
+    insight = {
+        "generated_at": now_iso(),
+        "db": os.environ.get("SRC_DB"),
+        "schemas": schemas,
+        "tables": risk_rank_tables(tables_out),
     }
+    insight["top_risks"] = detect_top_risks(insight["tables"])
+    return insight
 
 
-# -----------------------------
-# Pipeline steps
-# -----------------------------
-def run_masker(dry_limit: int | None):
-    env_copy = os.environ.copy()
-    if dry_limit:
-        env_copy["DRY_LIMIT"] = str(dry_limit)
-        print(f"▶ Running mask_db.py with DRY_LIMIT={dry_limit} …")
-    else:
-        env_copy.pop("DRY_LIMIT", None)
-        print("▶ Running mask_db.py (full) …")
-    proc = subprocess.run([sys.executable, "mask_db.py"], cwd=os.path.dirname(__file__), env=env_copy)
-    if proc.returncode != 0:
-        print("❌ mask_db.py failed", file=sys.stderr)
-        sys.exit(proc.returncode)
-    print("✅ mask_db.py completed")
+# ---------- Renderers ----------
+
+def as_markdown(report: Dict[str, Any]) -> str:
+    lines = []
+    lines.append(f"# Prod DB Insight — {report.get('db')}")
+    lines.append(f"_Generated: {report.get('generated_at')}_")
+    lines.append("")
+    lines.append("## Top Risks")
+    tr = report.get("top_risks", {})
+    for key, items in tr.items():
+        lines.append(f"- **{key.replace('_',' ').title()}** ({len(items)}):")
+        for v in items[:10]:
+            lines.append(f"  - {v}")
+        if len(items) > 10:
+            lines.append(f"  - … (+{len(items)-10} more)")
+    lines.append("")
+    lines.append("## Largest Tables")
+    for t in report.get("tables", [])[:10]:
+        lines.append(f"- `{t['schema']}.{t['table']}` — rows≈{t['row_est']:,}, size={t['size_bytes']:,} bytes")
+    lines.append("")
+    lines.append("## Notes")
+    lines.append("- This report uses Postgres metadata only (no scans, no raw values).")
+    lines.append("- `null_frac` and `n_distinct` come from `pg_stats` (estimates).")
+    lines.append("- PII likelihood is heuristic (column name/type).")
+    return "\n".join(lines)
 
 
-def sanity_checks(dst_db):
-    print("▶ Running sanity checks on masked DB …")
-    conn = connect(dst_db)
+# ---------- CLI ----------
 
-    checks = {}
-    # Row counts
-    checks["row_counts"] = {
-        "users": one_value(conn, "SELECT COUNT(*) FROM users;"),
-        "products": one_value(conn, "SELECT COUNT(*) FROM products;"),
-        "orders": one_value(conn, "SELECT COUNT(*) FROM orders;"),
-        "reviews": one_value(conn, "SELECT COUNT(*) FROM reviews;"),
-    }
-
-    # Email uniqueness & loose validity
-    checks["email_dupes"] = one_value(
-        conn,
-        "SELECT COUNT(*) FROM (SELECT email, COUNT(*) c FROM users GROUP BY 1 HAVING COUNT(*)>1) s;",
-    )
-    checks["email_invalid"] = one_value(
-        conn,
-        "SELECT COUNT(*) FROM users WHERE email NOT LIKE '%@%.__%';",
-    )
-
-    # FK orphans
-    checks["orphans"] = {
-        "orders_user": one_value(
-            conn,
-            "SELECT COUNT(*) FROM orders o LEFT JOIN users u ON u.id=o.user_id WHERE u.id IS NULL;",
-        ),
-        "orders_product": one_value(
-            conn,
-            "SELECT COUNT(*) FROM orders o LEFT JOIN products p ON p.id=o.product_id WHERE p.id IS NULL;",
-        ),
-        "reviews_user": one_value(
-            conn,
-            "SELECT COUNT(*) FROM reviews r LEFT JOIN users u ON u.id=r.user_id WHERE u.id IS NULL;",
-        ),
-        "reviews_product": one_value(
-            conn,
-            "SELECT COUNT(*) FROM reviews r LEFT JOIN products p ON p.id=r.product_id WHERE p.id IS NULL;",
-        ),
-    }
-
-    conn.close()
-    return checks
-
-
-# -----------------------------
-# Deep profiling (no raw values)
-# -----------------------------
-def safe_ratio(n: int, d: int) -> float:
-    return (float(n) / d) if d else 0.0
-
-
-def profile_column(conn, table: str, col: str, pg_type: str) -> Dict[str, Any]:
-    prof: Dict[str, Any] = {}
-    tot = one_value(conn, f'SELECT COUNT(*) FROM "{table}";') or 0
-    nulls = one_value(conn, f'SELECT COUNT(*) FROM "{table}" WHERE "{col}" IS NULL;') or 0
-    distinct = one_value(conn, f'SELECT COUNT(DISTINCT "{col}") FROM "{table}";') or 0
-    prof["counts"] = {"total": tot, "nulls": nulls, "distinct": distinct, "null_rate": safe_ratio(nulls, tot)}
-
-    # Type-specific summaries (no values)
-    if is_textual(pg_type):
-        # length summaries (min/avg/max) without revealing content
-        rs = rows(
-            conn,
-            f"""
-            SELECT
-              MIN(LENGTH("{col}")) AS min_len,
-              AVG(LENGTH("{col}")) AS avg_len,
-              MAX(LENGTH("{col}")) AS max_len
-            FROM "{table}"
-            WHERE "{col}" IS NOT NULL;
-            """,
-        )
-        prof["text_lengths"] = rs[0] if rs else {"min_len": None, "avg_len": None, "max_len": None}
-
-    if is_numeric(pg_type):
-        rs = rows(
-            conn,
-            f"""
-            SELECT
-              MIN("{col}") AS min_val,
-              AVG("{col}") AS avg_val,
-              MAX("{col}") AS max_val
-            FROM "{table}"
-            WHERE "{col}" IS NOT NULL;
-            """,
-        )
-        prof["numeric_summary"] = rs[0] if rs else {"min_val": None, "avg_val": None, "max_val": None}
-
-    if is_temporal(pg_type):
-        rs = rows(
-            conn,
-            f"""
-            SELECT
-              MIN("{col}") AS min_ts,
-              MAX("{col}") AS max_ts
-            FROM "{table}"
-            WHERE "{col}" IS NOT NULL;
-            """,
-        )
-        prof["temporal_range"] = rs[0] if rs else {"min_ts": None, "max_ts": None}
-
-    return prof
-
-
-PII_PATTERNS = {
-    "email": r'[\w\.-]+@[\w\.-]+\.[A-Za-z]{2,}',
-    "phone": r'(?:(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{2,4}\)?[\s-]?)?\d{3}[\s-]?\d{4})',
-    "ssn_like": r'\b\d{3}-\d{2}-\d{4}\b',
-    "cc_last4": r'\b\d{4}\b',
-}
-
-
-def pii_scan(conn, table: str, col: str, pg_type: str) -> Dict[str, Any]:
-    """Only scan textual columns. For others, return skipped."""
-    out = {"table": table, "column": col, "type": pg_type, "hits": {}, "scanned": False}
-    if not is_textual(pg_type):
-        out["skipped_reason"] = "non-text column"
-        return out
-    out["scanned"] = True
-    for name, pattern in PII_PATTERNS.items():
-        # Use REGEXP_MATCHES safe on text; cast to text for safety
-        out["hits"][name] = one_value(
-            conn,
-            f'SELECT COUNT(*) FROM "{table}" WHERE "{col}"::text ~ %s;',
-            (pattern,),
-        ) or 0
-    return out
-
-
-def deep_profile(src_db: str, dst_db: str, sample_tables: List[str] | None = None, limit_cols: int = 10) -> Dict[str, Any]:
-    src = connect(src_db)
-    dst = connect(dst_db)
-    try:
-        # Drive table list from masked DB; optionally filter
-        tables = sample_tables or list_tables(dst)
-        src_tables = set(list_tables(src))
-
-        payload: Dict[str, Any] = {"src_db": src_db, "dst_db": dst_db, "tables": []}
-
-        for t in tables:
-            # Example optional filter: exclude helper tables if desired
-            # if t.startswith("masking_"):
-            #     continue
-
-            dst_cols = list_columns(dst, t)[:limit_cols]
-            table_block: Dict[str, Any] = {"table": t, "in_src": (t in src_tables), "columns": [], "pii_scans": []}
-
-            for c in dst_cols:
-                col_name = c["column_name"]
-                data_type = c["data_type"]
-
-                # Profile in dst always
-                dst_prof = profile_column(dst, t, col_name, data_type)
-
-                # Profile in src only if table exists there
-                if t in src_tables:
-                    src_prof = profile_column(src, t, col_name, data_type)
-                else:
-                    src_prof = {"missing": True}
-
-                table_block["columns"].append(
-                    {"column": col_name, "type": data_type, "src": src_prof, "dst": dst_prof}
-                )
-
-                table_block["pii_scans"].append(pii_scan(dst, t, col_name, data_type))
-
-            payload["tables"].append(table_block)
-
-        return payload
-    finally:
-        src.close()
-        dst.close()
-
-
-# -----------------------------
-# AI summary (optional)
-# -----------------------------
-def maybe_ai_summary(checks: Dict[str, Any], deep_payload: Dict[str, Any] | None) -> str | None:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print("ℹ️ AI summary disabled (set OPENAI_API_KEY to enable).")
-        return None
-
-    try:
-        # Works for openai 1.47.0 and >=1.106
-        from openai import OpenAI
-
-        client = OpenAI(api_key=api_key)  # correct signature; no proxies arg
-    except Exception as e:
-        print(f"⚠️ OpenAI summary skipped: client init failed: {e}")
-        return None
-
-    prompt = {
-        "checks": checks,
-        "deep_profile": deep_payload or {},
-        "instruction": (
-            "You are a data quality assistant. Summarize the JSON using brief bullets. "
-            "Call out potential privacy risks (PII patterns), high null rates, very low distinctness, "
-            "and any table present only in masked DB. Do NOT reveal any actual values."
-        ),
-    }
-
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a data quality assistant."},
-                {"role": "user", "content": json.dumps(prompt, indent=2, default=str)},
-            ],
-            temperature=0.2,
-            max_tokens=350,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"⚠️ OpenAI summary failed: {e}")
-        return None
-
-
-# -----------------------------
-# Main
-# -----------------------------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=25, help="Rows per table for DRY run (0 = full).")
-    parser.add_argument("--ai", action="store_true", help="Generate AI summary.")
-    parser.add_argument("--deep", action="store_true", help="Run deep profiling (schema-level; no values).")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Prod DB metadata-based smoke test / insight.")
+    ap.add_argument("--prod-insight", action="store_true",
+                    help="Generate schema/data-quality insight from metadata.")
+    ap.add_argument("--schema-only", action="store_true",
+                    help="With --prod-insight, skip pg_stats (fastest).")
+    ap.add_argument("--format", choices=["json", "md"], default="json",
+                    help="Output format (default json).")
+    ap.add_argument("--out", default=None,
+                    help="Optional output file path; default prints to stdout.")
+    args = ap.parse_args()
 
-    # Ensure we run from tools/anonymizer
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    os.chdir(script_dir)
+    if not args.prod_insight:
+        # Default to insight mode if user forgot the flag (nice UX).
+        args.prod_insight = True
 
-    # Load .env locally
-    load_dotenv_from_here()
+    schemas = get_schemas_from_env()
 
-    src_db = env("SRC_DB", required=True)
-    dst_db = env("DST_DB", required=True)
+    with prod_conn() as conn:
+        report = build_prod_insight(conn, schemas=schemas, schema_only=args.schema_only)
 
-    print("=== Smoke Test: start ===")
-    print(f"Time: {datetime.now(timezone.utc).isoformat()}")
-    print(f"SRC_DB={src_db}  DST_DB={dst_db}")
+    if args.format == "md":
+        output = as_markdown(report)
+    else:
+        output = json.dumps(report, indent=2, default=str)
 
-    # DB connectivity
-    try:
-        with connect(src_db) as c:
-            one_value(c, "SELECT 1;")
-        with connect(dst_db) as c:
-            one_value(c, "SELECT 1;")
-        print("✅ DB connectivity OK")
-    except Exception as e:
-        print(f"❌ DB connectivity failed: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # Reset masked DB and run the anonymizer on a small slice (or full)
-    reset_masked_db(dst_db)
-    dry_limit = args.limit if args.limit > 0 else None
-    run_masker(dry_limit=dry_limit)
-
-    # Sanity checks
-    checks = sanity_checks(dst_db)
-    print("=== Sanity checks (masked DB) ===")
-    print(json.dumps(checks, indent=2))
-
-    deep_payload = None
-    if args.deep:
-        print("\n▶ Running deep profiling (no raw values) …")
-        try:
-            deep_payload = deep_profile(src_db, dst_db, sample_tables=None, limit_cols=12)
-            # Keep the stdout compact; print a small summary (counts only)
-            summary_view = {
-                "tables_profiled": len(deep_payload.get("tables", [])),
-                "example": deep_payload.get("tables", [])[:1],  # include just 1 table block as a preview
-            }
-            print(json.dumps(summary_view, indent=2, default=str))
-        except Exception as e:
-            print(f"⚠️ Deep profiling failed: {e}")
-
-    # Optional AI summary
-    if args.ai:
-        summary = maybe_ai_summary(checks, deep_payload)
-        if summary:
-            print("\n=== AI summary ===")
-            print(summary)
-
-    # Tip if the slice is small
-    if dry_limit and checks["row_counts"]["orders"] == 0:
-        print(
-            "\nℹ️ Tip: orders are 0 in this slice. Try a larger sample:\n"
-            "   python smoke_test.py --limit 200"
-        )
-
-    print("\n=== Smoke Test: done ===")
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(output)
+    else:
+        print(output)
 
 
 if __name__ == "__main__":
     main()
+
